@@ -1,6 +1,6 @@
 name: Projects
 
-# runs test suites of real projects with plain PHPUnit and with blink, compares results and speed
+# runs test suites of real projects with plain PHPUnit, blink and blink-rs, compares results and speed
 
 on:
     pull_request: null
@@ -38,6 +38,10 @@ jobs:
 
             -   run: go build -o blink .
 
+            -   uses: dtolnay/rust-toolchain@stable
+
+            -   run: cargo build --release --manifest-path rust/Cargo.toml && cp rust/target/release/blink-rs .
+
             # same extensions as Laravel's own CI
             -   uses: shivammathur/setup-php@v2
                 with:
@@ -73,18 +77,23 @@ jobs:
                     ../blink -c ${{ matrix.config }} | tee ../blink.out || true
                     echo "BLINK_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
 
+            # without timings of the Go run, so both start from the same state
+            -   name: Run blink-rs
+                working-directory: project
+                run: |
+                    rm -f .blink-timings.json
+                    start=$(date +%s.%N)
+                    ../blink-rs -c ${{ matrix.config }} | tee ../blink-rs.out || true
+                    echo "BLINK_RS_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
+
             -   name: Compare
                 run: |
                     phpunit_tests=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["tests"];')
                     phpunit_failed=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["failures"] + $s["errors"];')
                     phpunit_skipped=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["skipped"];')
 
-                    summary=$(grep '^Tests: ' blink.out)
-                    blink_tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
-                    blink_failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
-                    blink_skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
-
                     speedup=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_TIME" | bc)
+                    speedup_rs=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_RS_TIME" | bc)
 
                     {
                         echo "## ${{ matrix.name }}, ${{ matrix.repository }}@${{ matrix.ref }}, $(nproc) CPUs"
@@ -92,12 +101,28 @@ jobs:
                         echo "| Runner | Time | Tests | Failed | Skipped |"
                         echo "| --- | ---: | ---: | ---: | ---: |"
                         printf "| PHPUnit | %.1fs | %s | %s | %s |\n" "$PHPUNIT_TIME" "$phpunit_tests" "$phpunit_failed" "$phpunit_skipped"
-                        printf "| blink | %.1fs | %s | %s | %s |\n" "$BLINK_TIME" "$blink_tests" "$blink_failed" "$blink_skipped"
-                        echo
-                        echo "blink is **${speedup}x** faster"
                     } | tee -a "$GITHUB_STEP_SUMMARY"
 
-                    if [ "$phpunit_tests" != "$blink_tests" ] || [ "$phpunit_skipped" != "$blink_skipped" ]; then
-                        echo "::error::blink ran a different set of tests than PHPUnit"
-                        exit 1
-                    fi
+                    status=0
+                    for runner in blink blink-rs; do
+                        summary=$(grep '^Tests: ' $runner.out)
+                        tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
+                        failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
+                        skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
+                        time=$BLINK_TIME
+                        [ "$runner" = blink-rs ] && time=$BLINK_RS_TIME
+
+                        printf "| %s | %.1fs | %s | %s | %s |\n" "$runner" "$time" "$tests" "$failed" "$skipped" | tee -a "$GITHUB_STEP_SUMMARY"
+
+                        if [ "$phpunit_tests" != "$tests" ] || [ "$phpunit_skipped" != "$skipped" ]; then
+                            echo "::error::$runner ran a different set of tests than PHPUnit"
+                            status=1
+                        fi
+                    done
+
+                    {
+                        echo
+                        echo "blink is **${speedup}x** faster, blink-rs is **${speedup_rs}x** faster"
+                    } | tee -a "$GITHUB_STEP_SUMMARY"
+
+                    exit $status

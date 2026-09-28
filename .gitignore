@@ -4,3 +4,4 @@
 .phpunit.cache
 /fixtures/*/vendor
 /fixtures/*/composer.lock
+/rust/target

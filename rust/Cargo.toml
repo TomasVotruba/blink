@@ -1,0 +1,17 @@
+[package]
+name = "blink-rs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ctrlc = "3.5.2"
+glob = "0.3.4"
+libc = "0.2.189"
+roxmltree = "0.21.1"
+serde = "1.0.229"
+serde_json = "1.0.151"
+
+[profile.release]
+lto = true
+codegen-units = 1

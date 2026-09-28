@@ -19,6 +19,15 @@ Options:
 
 Requires the `pcntl` extension, so Linux or macOS only.
 
+## Rust version
+
+`rust/` holds a port of the same runner in Rust, to compare both. It shares `worker.php`, options and output with the Go version.
+
+```bash
+cargo build --release --manifest-path rust/Cargo.toml
+rust/target/release/blink-rs -j 4
+```
+
 ## How it works
 
 - Go starts N long-running `php worker.php` processes. Each loads `vendor/autoload.php` and all PHPUnit classes once.
@@ -73,6 +82,7 @@ time ../blink -c phpunit-unit.xml
 ```bash
 for v in 9 10 11 12 13; do (cd fixtures/phpunit-$v && composer install); done
 go test ./...
+cargo test --manifest-path rust/Cargo.toml
 ```
 
 `fixtures/tests` holds passing, failing, erroring, skipped, crashing and slow tests. It is shared by one small project per PHPUnit version.
