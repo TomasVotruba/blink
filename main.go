@@ -112,7 +112,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	report := newReport(stdout)
 
 	for result := range runChunks(ctx, chunks, workers, *php, script, autoloadFile, phpunitArgs) {
-		report.add(result)
+		report.add(&result)
 		maps.Copy(timings, result.Durations)
 	}
 
@@ -184,7 +184,7 @@ func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, scr
 						// the next run gets a fresh worker
 						w = nil
 					}
-					reruns := rerunFiles(result)
+					reruns := rerunFiles(&result)
 					if len(reruns) > 0 && len(result.notStarted()) == len(files) {
 						// nothing ran, the reruns report the problem
 						result.Problem, result.Output = "", ""
@@ -207,7 +207,7 @@ func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, scr
 
 // rerunFiles returns files that did not run because their run ended early.
 // Without any progress, e.g. on a syntax error, each file runs alone to find the broken one.
-func rerunFiles(result runResult) [][]string {
+func rerunFiles(result *runResult) [][]string {
 	if !result.Crashed && result.Problem == "" {
 		return nil
 	}

@@ -114,8 +114,8 @@ func (w *worker) readOutput(r io.Reader) {
 		line, err := reader.ReadBytes('\n')
 		buffer.Write(line)
 
-		if bytes.HasSuffix(buffer.Bytes(), []byte(outputMarker)) {
-			w.output <- string(bytes.TrimSuffix(buffer.Bytes(), []byte(outputMarker)))
+		if before, ok := bytes.CutSuffix(buffer.Bytes(), []byte(outputMarker)); ok {
+			w.output <- string(before)
 			buffer.Reset()
 		}
 
@@ -224,7 +224,7 @@ func (w *worker) run(files []string) (runResult, error) {
 			case signal != 0:
 				result.Problem = problem
 				result.Crashed = true
-			case exitCode != 0 && !result.hasFailures() && !noTestsExecuted(result):
+			case exitCode != 0 && !result.hasFailures() && !noTestsExecuted(&result):
 				result.Problem = problem
 			}
 
@@ -245,12 +245,12 @@ func (w *worker) run(files []string) (runResult, error) {
 func (w *worker) drainOutput() string {
 	w.kill()
 
-	var output string
+	var output strings.Builder
 	for chunk := range w.output {
-		output += chunk
+		output.WriteString(chunk)
 	}
 
-	return output
+	return output.String()
 }
 
 func (w *worker) kill() {
@@ -263,7 +263,7 @@ func (w *worker) stop() {
 	_ = w.cmd.Wait()
 }
 
-func (r runResult) hasFailures() bool {
+func (r *runResult) hasFailures() bool {
 	for _, test := range r.Tests {
 		if test.Status == failed {
 			return true
@@ -274,12 +274,12 @@ func (r runResult) hasFailures() bool {
 }
 
 // noTestsExecuted detects files with no matching tests, e.g. with --filter; PHPUnit 12+ exits with 1 then
-func noTestsExecuted(result runResult) bool {
+func noTestsExecuted(result *runResult) bool {
 	return len(result.Tests) == 0 && strings.Contains(result.Output, "No tests executed!")
 }
 
 // notStarted returns files of the run that have no started test
-func (r runResult) notStarted() []string {
+func (r *runResult) notStarted() []string {
 	var files []string
 	for _, file := range r.Files {
 		if !r.Started[file] {

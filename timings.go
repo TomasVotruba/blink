@@ -71,7 +71,7 @@ func chunkFiles(files []string, timings map[string]float64, count int) [][]strin
 
 	var chunks [][]string
 	var weights []float64
-	var chunk []string
+	var chunk []string //nolint:prealloc // starts empty for every chunk
 	chunkWeight := 0.0
 
 	for _, file := range files {

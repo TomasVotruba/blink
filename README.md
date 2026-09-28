@@ -27,6 +27,47 @@ Requires the `pcntl` extension, so Linux or macOS only.
 - If a child crashes, files it did not reach run again in a new child. If nothing ran at all, e.g. on a syntax error, each file runs alone to find the broken one.
 - Results come back via `--log-teamcity php://fd/3`, a pipe only Go reads, so test output can't break it. Go prints progress, failures and a summary.
 
+## Benchmark
+
+Measured on 2026-09-28 by the [Projects workflow](.github/workflows/projects.yaml), [run 36416588787](https://github.com/TomasVotruba/blink/actions/runs/36416588787):
+
+| Project | PHPUnit | blink | Speedup | Tests | Skipped |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [laravel/framework](https://github.com/laravel/framework) `v13.33.0`, unit tests | 35.8s | 11.0s | **3.2x** | 12,359 | 87 |
+| [rectorphp/rector-src](https://github.com/rectorphp/rector-src) `29e434b` | 32.7s | 13.2s | **2.4x** | 5,306 | 1 |
+
+Setup:
+
+- GitHub Actions `ubuntu-latest`, 4 CPUs
+- PHP 8.4, PHPUnit 13.3, blink [`66c06f9`](https://github.com/TomasVotruba/blink/commit/66c06f9) with default options, so 4 workers
+- `vendor/bin/phpunit` runs first, then blink without a previous `.blink-timings.json`
+- Time is wall time of the whole command, including PHPUnit boot
+- Laravel runs without `tests/Integration`, its integration tests share caches and files and are not safe to run in parallel
+- Both runners report the same number of tests and skips, the workflow fails otherwise
+
+Reproduce:
+
+```bash
+go build -o blink .
+
+git clone https://github.com/rectorphp/rector-src.git
+cd rector-src
+git checkout 29e434b2065ae4a78a6b1eca4295620a5f6a2a5a
+composer install
+
+time vendor/bin/phpunit
+time ../blink
+```
+
+For Laravel, check out `v13.33.0` of laravel/framework and exclude integration tests first:
+
+```bash
+sed 's|<directory suffix="Test.php">./tests</directory>|&<exclude>./tests/Integration</exclude>|' phpunit.xml.dist > phpunit-unit.xml
+
+time vendor/bin/phpunit -c phpunit-unit.xml
+time ../blink -c phpunit-unit.xml
+```
+
 ## Tests
 
 ```bash

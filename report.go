@@ -22,7 +22,7 @@ func newReport(out io.Writer) *report {
 	return &report{out: out, counts: map[status]int{}}
 }
 
-func (r *report) add(result runResult) {
+func (r *report) add(result *runResult) {
 	for _, test := range result.Tests {
 		r.counts[test.Status]++
 
@@ -85,7 +85,7 @@ func formatFailure(test testResult) string {
 	return text
 }
 
-func formatProblem(result runResult) string {
+func formatProblem(result *runResult) string {
 	files := result.Files[0]
 	if len(result.Files) > 1 {
 		files += fmt.Sprintf(" and %d more files", len(result.Files)-1)
