@@ -1,0 +1,6 @@
+/blink
+.blink-timings.json
+.phpunit.result.cache
+.phpunit.cache
+/fixtures/*/vendor
+/fixtures/*/composer.lock
