@@ -1,6 +1,6 @@
 name: Projects
 
-# runs test suites of real projects with plain PHPUnit, blink and blink-rs, compares results and speed
+# runs test suites of real projects with plain PHPUnit, ParaTest, blink and blink-rs, compares results and speed
 
 on:
     pull_request: null
@@ -21,11 +21,14 @@ jobs:
                         repository: laravel/framework
                         ref: v13.33.0
                         config: phpunit-unit.xml
+                        paratest: true
 
                     -   name: Rector
                         repository: rectorphp/rector-src
                         ref: 29e434b2065ae4a78a6b1eca4295620a5f6a2a5a
                         config: phpunit.xml
+                        # ParaTest 7.24+ needs symfony/console 7.4+, Rector locks 6.4
+                        paratest: false
 
         name: ${{ matrix.name }}
 
@@ -58,6 +61,10 @@ jobs:
 
             -   run: composer install --working-dir=project --no-interaction --no-progress --prefer-dist
 
+            -   name: Install ParaTest
+                if: matrix.paratest
+                run: composer require --dev brianium/paratest --working-dir=project --no-interaction --no-progress --with-all-dependencies
+
             -   name: Create Laravel unit test config
                 if: matrix.repository == 'laravel/framework'
                 working-directory: project
@@ -69,6 +76,14 @@ jobs:
                     start=$(date +%s.%N)
                     vendor/bin/phpunit -c ${{ matrix.config }} --no-progress --log-junit ../phpunit.xml || true
                     echo "PHPUNIT_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
+
+            -   name: Run ParaTest
+                if: matrix.paratest
+                working-directory: project
+                run: |
+                    start=$(date +%s.%N)
+                    vendor/bin/paratest -c ${{ matrix.config }} --processes=$(nproc) --no-progress --log-junit ../paratest.xml || true
+                    echo "PARATEST_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
 
             -   name: Run blink
                 working-directory: project
@@ -88,41 +103,49 @@ jobs:
 
             -   name: Compare
                 run: |
-                    phpunit_tests=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["tests"];')
-                    phpunit_failed=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["failures"] + $s["errors"];')
-                    phpunit_skipped=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["skipped"];')
-
-                    speedup=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_TIME" | bc)
-                    speedup_rs=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_RS_TIME" | bc)
-
-                    {
-                        echo "## ${{ matrix.name }}, ${{ matrix.repository }}@${{ matrix.ref }}, $(nproc) CPUs"
-                        echo
-                        echo "| Runner | Time | Tests | Failed | Skipped |"
-                        echo "| --- | ---: | ---: | ---: | ---: |"
-                        printf "| PHPUnit | %.1fs | %s | %s | %s |\n" "$PHPUNIT_TIME" "$phpunit_tests" "$phpunit_failed" "$phpunit_skipped"
-                    } | tee -a "$GITHUB_STEP_SUMMARY"
+                    junit() {
+                        php -r '$s = simplexml_load_file($argv[1])->testsuite; echo $s["tests"], " ", $s["failures"] + $s["errors"], " ", $s["skipped"];' "$1"
+                    }
 
                     status=0
-                    for runner in blink blink-rs; do
-                        summary=$(grep '^Tests: ' $runner.out)
-                        tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
-                        failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
-                        skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
-                        time=$BLINK_TIME
-                        [ "$runner" = blink-rs ] && time=$BLINK_RS_TIME
 
-                        printf "| %s | %.1fs | %s | %s | %s |\n" "$runner" "$time" "$tests" "$failed" "$skipped" | tee -a "$GITHUB_STEP_SUMMARY"
+                    # prints one row and checks the runner ran the same tests as PHPUnit
+                    row() {
+                        local runner=$1 time=$2 tests=$3 failed=$4 skipped=$5
+                        printf "| %s | %.1fs | %.1fx | %s | %s | %s |\n" "$runner" "$time" "$(echo "scale=2; $PHPUNIT_TIME / $time" | bc)" "$tests" "$failed" "$skipped"
 
                         if [ "$phpunit_tests" != "$tests" ] || [ "$phpunit_skipped" != "$skipped" ]; then
-                            echo "::error::$runner ran a different set of tests than PHPUnit"
+                            echo "::error::$runner ran a different set of tests than PHPUnit" >&2
                             status=1
                         fi
-                    done
+                    }
 
+                    read -r phpunit_tests phpunit_failed phpunit_skipped <<< "$(junit phpunit.xml)"
+
+                    echo "## ${{ matrix.name }}, ${{ matrix.repository }}@${{ matrix.ref }}, $(nproc) CPUs" >> "$GITHUB_STEP_SUMMARY"
                     {
                         echo
-                        echo "blink is **${speedup}x** faster, blink-rs is **${speedup_rs}x** faster"
-                    } | tee -a "$GITHUB_STEP_SUMMARY"
+                        echo "| Runner | Time | Speedup | Tests | Failed | Skipped |"
+                        echo "| --- | ---: | ---: | ---: | ---: | ---: |"
+                        row PHPUnit "$PHPUNIT_TIME" "$phpunit_tests" "$phpunit_failed" "$phpunit_skipped"
+
+                        if [ -f paratest.xml ]; then
+                            read -r tests failed skipped <<< "$(junit paratest.xml)"
+                            row ParaTest "$PARATEST_TIME" "$tests" "$failed" "$skipped"
+                        fi
+
+                        for runner in blink blink-rs; do
+                            summary=$(grep '^Tests: ' $runner.out)
+                            tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
+                            failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
+                            skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
+                            time=$BLINK_TIME
+                            [ "$runner" = blink-rs ] && time=$BLINK_RS_TIME
+
+                            row "$runner" "$time" "$tests" "$failed" "$skipped"
+                        done
+                    } > table.md
+
+                    tee -a "$GITHUB_STEP_SUMMARY" < table.md
 
                     exit $status
