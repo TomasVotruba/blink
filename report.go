@@ -22,7 +22,7 @@ func newReport(out io.Writer) *report {
 	return &report{out: out, counts: map[status]int{}}
 }
 
-func (r *report) add(result fileResult) {
+func (r *report) add(result runResult) {
 	for _, test := range result.Tests {
 		r.counts[test.Status]++
 
@@ -66,7 +66,7 @@ func (r *report) finish(elapsed time.Duration) int {
 	}
 
 	total := r.counts[passed] + r.counts[failed] + r.counts[skipped]
-	fmt.Fprintf(r.out, "Tests: %d, Passed: %d, Failed: %d, Skipped: %d, Broken files: %d - %.2fs\n",
+	fmt.Fprintf(r.out, "Tests: %d, Passed: %d, Failed: %d, Skipped: %d, Broken runs: %d - %.2fs\n",
 		total, r.counts[passed], r.counts[failed], r.counts[skipped], len(r.problems), elapsed.Seconds())
 
 	if r.counts[failed] > 0 || len(r.problems) > 0 {
@@ -85,8 +85,13 @@ func formatFailure(test testResult) string {
 	return text
 }
 
-func formatProblem(result fileResult) string {
-	text := result.File + ": " + result.Problem + "\n"
+func formatProblem(result runResult) string {
+	files := result.Files[0]
+	if len(result.Files) > 1 {
+		files += fmt.Sprintf(" and %d more files", len(result.Files)-1)
+	}
+
+	text := files + ": " + result.Problem + "\n"
 	if output := strings.TrimSpace(result.Output); output != "" {
 		text += "\n" + output + "\n"
 	}

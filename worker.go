@@ -9,10 +9,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 )
 
 const outputMarker = "\x00blink-eof\x00\n"
@@ -27,18 +27,25 @@ const (
 
 type testResult struct {
 	Name    string
+	File    string
 	Status  status
 	Message string
 	Details string
 }
 
-type fileResult struct {
-	File     string
-	Tests    []testResult
-	Duration time.Duration
-	// Problem is set when the file failed outside of a test, e.g. crash, fatal error or broken config
+// runResult is the outcome of one batch of test files run in a single PHPUnit process.
+type runResult struct {
+	Files []string
+	Tests []testResult
+	// Started holds files that have at least one test started, the rest did not run, e.g. after a crash
+	Started map[string]bool
+	// Durations holds summed test durations in seconds per file
+	Durations map[string]float64
+	// Problem is set when the run failed outside of a test, e.g. crash, fatal error or broken config
 	Problem string
 	Output  string
+	// Crashed is set when the process ended early, so some files may not have run
+	Crashed bool
 }
 
 // worker is one long-running "php worker.php" process that runs test files one by one.
@@ -124,19 +131,35 @@ func (w *worker) readOutput(r io.Reader) {
 
 var errWorkerDied = errors.New("worker died")
 
-// run sends one test file to the worker and collects its results.
+// run sends test files to the worker, which runs them in one PHPUnit process, and collects the results.
 // It returns errWorkerDied when the worker process is gone and has to be replaced.
-func (w *worker) run(file string) (fileResult, error) {
-	result := fileResult{File: file}
+func (w *worker) run(files []string) (runResult, error) {
+	result := runResult{Files: files, Started: map[string]bool{}, Durations: map[string]float64{}}
 
-	if _, err := fmt.Fprintln(w.stdin, file); err != nil {
-		result.Problem = "worker died before running the file"
+	// PHPUnit reports real absolute paths
+	fileByPath := map[string]string{}
+	for _, file := range files {
+		fileByPath[realPath(file)] = file
+	}
+
+	if _, err := fmt.Fprintln(w.stdin, strings.Join(files, "\t")); err != nil {
+		result.Problem = "worker died before running the files"
+		result.Crashed = true
 		result.Output = w.drainOutput()
 		return result, errWorkerDied
 	}
 
 	var current *testResult
-	testCount := 0
+
+	// a test that never finished crashed its process, blame it
+	crashed := func(message, output string) {
+		result.Crashed = true
+		current.Status = failed
+		current.Message = message
+		current.Details = output
+		result.Tests = append(result.Tests, *current)
+		current = nil
+	}
 
 	for w.events.Scan() {
 		msg, ok := parseMessage(w.events.Text())
@@ -146,30 +169,37 @@ func (w *worker) run(file string) (fileResult, error) {
 
 		switch msg.Name {
 		case "testStarted":
-			current = &testResult{Name: testName(msg), Status: passed}
+			if current != nil {
+				// PHPUnit 9 runs each file in its own process, so the next file starts after a crash
+				crashed("process crashed during test", "")
+			}
+
+			file := fileByPath[testPath(msg)]
+			result.Started[file] = true
+			current = &testResult{Name: testName(msg), File: file, Status: passed}
 		case "testFailed":
 			if current != nil {
 				current.Status = failed
 				current.Message = msg.Attrs["message"]
 				current.Details = msg.Attrs["details"]
 			}
-		case "testCount":
-			testCount, _ = strconv.Atoi(msg.Attrs["count"])
 		case "testIgnored":
+			// a skipped class comes as "classSkipped" with the number of its tests
 			if current != nil {
 				current.Status = skipped
 				current.Message = msg.Attrs["message"]
-				continue
-			}
-
-			// PHPUnit 10+ skips a whole class with one message, e.g. for a missing extension
-			for range max(testCount-len(result.Tests), 1) {
-				result.Tests = append(result.Tests, testResult{Name: msg.Attrs["name"], Status: skipped, Message: msg.Attrs["message"]})
 			}
 		case "testFinished":
 			if current != nil {
+				milliseconds, _ := strconv.ParseFloat(msg.Attrs["duration"], 64)
+				result.Durations[current.File] += milliseconds / 1000
 				result.Tests = append(result.Tests, *current)
 				current = nil
+			}
+		case "classSkipped":
+			count, _ := strconv.Atoi(msg.Attrs["count"])
+			for range count {
+				result.Tests = append(result.Tests, testResult{Name: msg.Attrs["name"], Status: skipped, Message: msg.Attrs["message"]})
 			}
 		case "done":
 			if msg.Kind != "blink" {
@@ -190,13 +220,10 @@ func (w *worker) run(file string) (fileResult, error) {
 
 			switch {
 			case current != nil:
-				// crashed in the middle of a test, blame that test
-				current.Status = failed
-				current.Message = problem
-				current.Details = result.Output
-				result.Tests = append(result.Tests, *current)
+				crashed(problem, result.Output)
 			case signal != 0:
 				result.Problem = problem
+				result.Crashed = true
 			case exitCode != 0 && !result.hasFailures() && !noTestsExecuted(result):
 				result.Problem = problem
 			}
@@ -206,12 +233,10 @@ func (w *worker) run(file string) (fileResult, error) {
 	}
 
 	result.Problem = "worker died"
+	result.Crashed = true
 	result.Output = w.drainOutput()
 	if current != nil {
-		current.Status = failed
-		current.Message = result.Problem
-		current.Details = result.Output
-		result.Tests = append(result.Tests, *current)
+		crashed(result.Problem, result.Output)
 	}
 
 	return result, errWorkerDied
@@ -238,7 +263,7 @@ func (w *worker) stop() {
 	_ = w.cmd.Wait()
 }
 
-func (r fileResult) hasFailures() bool {
+func (r runResult) hasFailures() bool {
 	for _, test := range r.Tests {
 		if test.Status == failed {
 			return true
@@ -248,7 +273,32 @@ func (r fileResult) hasFailures() bool {
 	return false
 }
 
-// noTestsExecuted detects a file with no matching tests, e.g. with --filter; PHPUnit 12+ exits with 1 then
-func noTestsExecuted(result fileResult) bool {
+// noTestsExecuted detects files with no matching tests, e.g. with --filter; PHPUnit 12+ exits with 1 then
+func noTestsExecuted(result runResult) bool {
 	return len(result.Tests) == 0 && strings.Contains(result.Output, "No tests executed!")
+}
+
+// notStarted returns files of the run that have no started test
+func (r runResult) notStarted() []string {
+	var files []string
+	for _, file := range r.Files {
+		if !r.Started[file] {
+			files = append(files, file)
+		}
+	}
+
+	return files
+}
+
+func realPath(file string) string {
+	path, err := filepath.Abs(file)
+	if err != nil {
+		return file
+	}
+
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+
+	return path
 }

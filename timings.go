@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -38,25 +39,75 @@ func saveTimings(path string, timings map[string]float64) error {
 	return os.WriteFile(path, append(content, '\n'), 0o644)
 }
 
-// sortSlowestFirst puts files without a known duration first, then the slowest ones,
-// so the long files start early and the short ones fill the gaps at the end.
-func sortSlowestFirst(files []string, timings map[string]float64) {
-	slices.SortStableFunc(files, func(a, b string) int {
-		durationA, knownA := timings[a]
-		durationB, knownB := timings[b]
+// chunkFiles splits files into about count chunks of similar total duration, slowest chunk first.
+// Neighbour files stay together, as they often share fixtures and warm caches.
+// Files without a known duration count as an average one.
+func chunkFiles(files []string, timings map[string]float64, count int) [][]string {
+	known, sum := 0, 0.0
+	for _, file := range files {
+		if duration, ok := timings[file]; ok {
+			known++
+			sum += duration
+		}
+	}
 
-		switch {
-		case knownA != knownB:
-			if !knownA {
-				return -1
-			}
-			return 1
-		case durationA > durationB:
-			return -1
-		case durationA < durationB:
-			return 1
+	average := 1.0
+	if known > 0 && sum > 0 {
+		average = sum / float64(known)
+	}
+
+	weight := func(file string) float64 {
+		if duration, ok := timings[file]; ok {
+			return duration
+		}
+		return average
+	}
+
+	total := 0.0
+	for _, file := range files {
+		total += weight(file)
+	}
+	target := total / float64(count)
+
+	var chunks [][]string
+	var weights []float64
+	var chunk []string
+	chunkWeight := 0.0
+
+	for _, file := range files {
+		// a heavy file starts its own chunk instead of overfilling the current one
+		if len(chunk) > 0 && chunkWeight+weight(file) > target {
+			chunks = append(chunks, chunk)
+			weights = append(weights, chunkWeight)
+			chunk, chunkWeight = nil, 0
 		}
 
-		return 0
+		chunk = append(chunk, file)
+		chunkWeight += weight(file)
+
+		if chunkWeight >= target {
+			chunks = append(chunks, chunk)
+			weights = append(weights, chunkWeight)
+			chunk, chunkWeight = nil, 0
+		}
+	}
+	if len(chunk) > 0 {
+		chunks = append(chunks, chunk)
+		weights = append(weights, chunkWeight)
+	}
+
+	indexes := make([]int, len(chunks))
+	for i := range indexes {
+		indexes[i] = i
+	}
+	slices.SortStableFunc(indexes, func(a, b int) int {
+		return cmp.Compare(weights[b], weights[a])
 	})
+
+	sorted := make([][]string, len(chunks))
+	for i, index := range indexes {
+		sorted[i] = chunks[index]
+	}
+
+	return sorted
 }

@@ -76,3 +76,11 @@ func testName(msg message) string {
 
 	return msg.Attrs["name"]
 }
+
+// testPath turns "php_qn:///path/FooTest.php::\App\FooTest::testBar" into "/path/FooTest.php".
+func testPath(msg message) string {
+	location := strings.TrimPrefix(msg.Attrs["locationHint"], "php_qn://")
+	path, _, _ := strings.Cut(location, `::\`)
+
+	return path
+}

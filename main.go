@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +16,9 @@ import (
 	"sync"
 	"time"
 )
+
+// more chunks than workers lets a free worker pick up remaining work, fewer saves on PHPUnit and app boots
+const chunksPerWorker = 3
 
 //go:embed worker.php
 var workerScript []byte
@@ -96,20 +100,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ignoring %s: %v\n", timingsFile, err)
 		timings = map[string]float64{}
 	}
-	sortSlowestFirst(files, timings)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	workers := min(*workerCount, len(files))
+	chunks := chunkFiles(files, timings, workers*chunksPerWorker)
 	fmt.Fprintf(stdout, "blink - %d files, %d workers\n\n", len(files), workers)
 
 	start := time.Now()
 	report := newReport(stdout)
 
-	for result := range runFiles(ctx, files, workers, *php, script, autoloadFile, phpunitArgs) {
+	for result := range runChunks(ctx, chunks, workers, *php, script, autoloadFile, phpunitArgs) {
 		report.add(result)
-		timings[result.File] = result.Duration.Seconds()
+		maps.Copy(timings, result.Durations)
 	}
 
 	if ctx.Err() != nil {
@@ -134,16 +138,16 @@ func splitArgs(args []string) ([]string, []string) {
 	return args[:index], args[index+1:]
 }
 
-// runFiles runs files on a pool of workers. Every worker takes the next file from one shared queue
-// once it is free, so a fast worker picks up more files.
-func runFiles(ctx context.Context, files []string, workerCount int, php, script, autoloadFile string, phpunitArgs []string) <-chan fileResult {
-	queue := make(chan string, len(files))
-	for _, file := range files {
-		queue <- file
+// runChunks runs chunks of files on a pool of workers. Every worker takes the next chunk from one shared queue
+// once it is free, so a fast worker picks up more chunks.
+func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, script, autoloadFile string, phpunitArgs []string) <-chan runResult {
+	queue := make(chan []string, len(chunks))
+	for _, chunk := range chunks {
+		queue <- chunk
 	}
 	close(queue)
 
-	results := make(chan fileResult)
+	results := make(chan runResult)
 	var wg sync.WaitGroup
 
 	for range workerCount {
@@ -155,29 +159,40 @@ func runFiles(ctx context.Context, files []string, workerCount int, php, script,
 				}
 			}()
 
-			for file := range queue {
-				if ctx.Err() != nil {
-					return
-				}
+			for chunk := range queue {
+				pending := [][]string{chunk}
 
-				if w == nil {
-					var err error
-					w, err = startWorker(ctx, php, script, autoloadFile, phpunitArgs)
-					if err != nil {
-						results <- fileResult{File: file, Problem: "cannot start worker: " + err.Error()}
-						continue
+				for len(pending) > 0 {
+					if ctx.Err() != nil {
+						return
 					}
-				}
 
-				start := time.Now()
-				result, err := w.run(file)
-				result.Duration = time.Since(start)
-				if errors.Is(err, errWorkerDied) {
-					// the next file gets a fresh worker
-					w = nil
-				}
+					files := pending[0]
+					pending = pending[1:]
 
-				results <- result
+					if w == nil {
+						var err error
+						w, err = startWorker(ctx, php, script, autoloadFile, phpunitArgs)
+						if err != nil {
+							results <- runResult{Files: files, Problem: "cannot start worker: " + err.Error()}
+							continue
+						}
+					}
+
+					result, err := w.run(files)
+					if errors.Is(err, errWorkerDied) {
+						// the next run gets a fresh worker
+						w = nil
+					}
+					reruns := rerunFiles(result)
+					if len(reruns) > 0 && len(result.notStarted()) == len(files) {
+						// nothing ran, the reruns report the problem
+						result.Problem, result.Output = "", ""
+					}
+
+					results <- result
+					pending = append(pending, reruns...)
+				}
 			}
 		})
 	}
@@ -188,4 +203,28 @@ func runFiles(ctx context.Context, files []string, workerCount int, php, script,
 	}()
 
 	return results
+}
+
+// rerunFiles returns files that did not run because their run ended early.
+// Without any progress, e.g. on a syntax error, each file runs alone to find the broken one.
+func rerunFiles(result runResult) [][]string {
+	if !result.Crashed && result.Problem == "" {
+		return nil
+	}
+
+	notStarted := result.notStarted()
+	switch {
+	case len(notStarted) == 0:
+		return nil
+	case len(notStarted) < len(result.Files):
+		return [][]string{notStarted}
+	case len(notStarted) > 1:
+		var runs [][]string
+		for _, file := range notStarted {
+			runs = append(runs, []string{file})
+		}
+		return runs
+	}
+
+	return nil
 }

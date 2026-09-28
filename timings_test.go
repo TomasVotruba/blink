@@ -6,15 +6,25 @@ import (
 	"testing"
 )
 
-func TestSortSlowestFirst(t *testing.T) {
-	files := []string{"fast.php", "unknown.php", "slow.php", "medium.php"}
-	timings := map[string]float64{"fast.php": 0.1, "slow.php": 3, "medium.php": 1}
+func TestChunkFiles(t *testing.T) {
+	files := []string{"a.php", "b.php", "c.php", "d.php", "e.php"}
+	timings := map[string]float64{"a.php": 1, "b.php": 1, "c.php": 4, "d.php": 1}
 
-	sortSlowestFirst(files, timings)
+	// e.php is unknown, so it counts as the average of 1.75
+	chunks := chunkFiles(files, timings, 3)
 
-	expected := []string{"unknown.php", "slow.php", "medium.php", "fast.php"}
-	if !slices.Equal(files, expected) {
-		t.Errorf("expected %v, got %v", expected, files)
+	expected := [][]string{{"c.php"}, {"d.php", "e.php"}, {"a.php", "b.php"}}
+	if !slices.EqualFunc(chunks, expected, slices.Equal) {
+		t.Errorf("expected %v, got %v", expected, chunks)
+	}
+}
+
+func TestChunkFilesWithoutTimings(t *testing.T) {
+	chunks := chunkFiles([]string{"a.php", "b.php", "c.php", "d.php"}, map[string]float64{}, 2)
+
+	expected := [][]string{{"a.php", "b.php"}, {"c.php", "d.php"}}
+	if !slices.EqualFunc(chunks, expected, slices.Equal) {
+		t.Errorf("expected %v, got %v", expected, chunks)
 	}
 }
 

@@ -1,6 +1,6 @@
-name: Laravel
+name: Projects
 
-# runs the Laravel framework unit tests with plain PHPUnit and with blink, compares results and speed
+# runs test suites of real projects with plain PHPUnit and with blink, compares results and speed
 
 on:
     pull_request: null
@@ -8,12 +8,26 @@ on:
         branches:
             - main
 
-env:
-    LARAVEL_VERSION: v13.33.0
-
 jobs:
-    laravel:
+    project:
         runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # integration tests share caches and files, so they are not safe to run in parallel
+                    -   name: Laravel unit tests
+                        repository: laravel/framework
+                        ref: v13.33.0
+                        config: phpunit-unit.xml
+
+                    -   name: Rector
+                        repository: rectorphp/rector-src
+                        ref: 29e434b2065ae4a78a6b1eca4295620a5f6a2a5a
+                        config: phpunit.xml
+
+        name: ${{ matrix.name }}
 
         steps:
             -   uses: actions/checkout@v4
@@ -32,27 +46,31 @@ jobs:
                     ini-values: memory_limit=2G
                     coverage: none
 
-            -   run: git clone --depth 1 --branch "$LARAVEL_VERSION" https://github.com/laravel/framework.git laravel
+            -   uses: actions/checkout@v4
+                with:
+                    repository: ${{ matrix.repository }}
+                    ref: ${{ matrix.ref }}
+                    path: project
 
-            -   run: composer update --working-dir=laravel --no-interaction --no-progress --prefer-dist
+            -   run: composer install --working-dir=project --no-interaction --no-progress --prefer-dist
 
-            # integration tests share caches and files, so they are not safe to run in parallel
-            -   name: Create unit test config
-                working-directory: laravel
+            -   name: Create Laravel unit test config
+                if: matrix.repository == 'laravel/framework'
+                working-directory: project
                 run: sed 's|<directory suffix="Test.php">./tests</directory>|&<exclude>./tests/Integration</exclude>|' phpunit.xml.dist > phpunit-unit.xml
 
             -   name: Run PHPUnit
-                working-directory: laravel
+                working-directory: project
                 run: |
                     start=$(date +%s.%N)
-                    vendor/bin/phpunit -c phpunit-unit.xml --no-progress --log-junit ../phpunit.xml || true
+                    vendor/bin/phpunit -c ${{ matrix.config }} --no-progress --log-junit ../phpunit.xml || true
                     echo "PHPUNIT_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
 
             -   name: Run blink
-                working-directory: laravel
+                working-directory: project
                 run: |
                     start=$(date +%s.%N)
-                    ../blink -c phpunit-unit.xml | tee ../blink.out || true
+                    ../blink -c ${{ matrix.config }} | tee ../blink.out || true
                     echo "BLINK_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
 
             -   name: Compare
@@ -69,7 +87,7 @@ jobs:
                     speedup=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_TIME" | bc)
 
                     {
-                        echo "## Laravel $LARAVEL_VERSION unit tests, $(nproc) CPUs"
+                        echo "## ${{ matrix.name }}, ${{ matrix.repository }}@${{ matrix.ref }}, $(nproc) CPUs"
                         echo
                         echo "| Runner | Time | Tests | Failed | Skipped |"
                         echo "| --- | ---: | ---: | ---: | ---: |"
