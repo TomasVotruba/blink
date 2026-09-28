@@ -31,7 +31,7 @@ func TestFixtures(t *testing.T) {
 			}
 
 			for _, expected := range []string{
-				"Tests: 13, Passed: 9, Failed: 3, Skipped: 1, Broken files: 0",
+				"Tests: 13, Passed: 9, Failed: 3, Skipped: 1, Broken runs: 0",
 				`Fixture\FailingTest::testFails` + "\nFailed asserting that 2 is identical to 1.",
 				`Fixture\ErrorTest::testThrows` + "\nRuntimeException", // PHPUnit 9 adds a space before ":"
 				"Something broke",

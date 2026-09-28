@@ -1,0 +1,103 @@
+name: Projects
+
+# runs test suites of real projects with plain PHPUnit and with blink, compares results and speed
+
+on:
+    pull_request: null
+    push:
+        branches:
+            - main
+
+jobs:
+    project:
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # integration tests share caches and files, so they are not safe to run in parallel
+                    -   name: Laravel unit tests
+                        repository: laravel/framework
+                        ref: v13.33.0
+                        config: phpunit-unit.xml
+
+                    -   name: Rector
+                        repository: rectorphp/rector-src
+                        ref: 29e434b2065ae4a78a6b1eca4295620a5f6a2a5a
+                        config: phpunit.xml
+
+        name: ${{ matrix.name }}
+
+        steps:
+            -   uses: actions/checkout@v4
+
+            -   uses: actions/setup-go@v5
+                with:
+                    go-version-file: go.mod
+
+            -   run: go build -o blink .
+
+            # same extensions as Laravel's own CI
+            -   uses: shivammathur/setup-php@v2
+                with:
+                    php-version: 8.4
+                    extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, gd, redis, igbinary, msgpack, memcached, gmp
+                    ini-values: memory_limit=2G
+                    coverage: none
+
+            -   uses: actions/checkout@v4
+                with:
+                    repository: ${{ matrix.repository }}
+                    ref: ${{ matrix.ref }}
+                    path: project
+
+            -   run: composer install --working-dir=project --no-interaction --no-progress --prefer-dist
+
+            -   name: Create Laravel unit test config
+                if: matrix.repository == 'laravel/framework'
+                working-directory: project
+                run: sed 's|<directory suffix="Test.php">./tests</directory>|&<exclude>./tests/Integration</exclude>|' phpunit.xml.dist > phpunit-unit.xml
+
+            -   name: Run PHPUnit
+                working-directory: project
+                run: |
+                    start=$(date +%s.%N)
+                    vendor/bin/phpunit -c ${{ matrix.config }} --no-progress --log-junit ../phpunit.xml || true
+                    echo "PHPUNIT_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
+
+            -   name: Run blink
+                working-directory: project
+                run: |
+                    start=$(date +%s.%N)
+                    ../blink -c ${{ matrix.config }} | tee ../blink.out || true
+                    echo "BLINK_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
+
+            -   name: Compare
+                run: |
+                    phpunit_tests=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["tests"];')
+                    phpunit_failed=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["failures"] + $s["errors"];')
+                    phpunit_skipped=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["skipped"];')
+
+                    summary=$(grep '^Tests: ' blink.out)
+                    blink_tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
+                    blink_failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
+                    blink_skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
+
+                    speedup=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_TIME" | bc)
+
+                    {
+                        echo "## ${{ matrix.name }}, ${{ matrix.repository }}@${{ matrix.ref }}, $(nproc) CPUs"
+                        echo
+                        echo "| Runner | Time | Tests | Failed | Skipped |"
+                        echo "| --- | ---: | ---: | ---: | ---: |"
+                        printf "| PHPUnit | %.1fs | %s | %s | %s |\n" "$PHPUNIT_TIME" "$phpunit_tests" "$phpunit_failed" "$phpunit_skipped"
+                        printf "| blink | %.1fs | %s | %s | %s |\n" "$BLINK_TIME" "$blink_tests" "$blink_failed" "$blink_skipped"
+                        echo
+                        echo "blink is **${speedup}x** faster"
+                    } | tee -a "$GITHUB_STEP_SUMMARY"
+
+                    if [ "$phpunit_tests" != "$blink_tests" ] || [ "$phpunit_skipped" != "$blink_skipped" ]; then
+                        echo "::error::blink ran a different set of tests than PHPUnit"
+                        exit 1
+                    fi

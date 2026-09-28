@@ -1,6 +1,6 @@
 # blink
 
-Parallel PHPUnit runner written in Go. Works with PHPUnit 9 to 13.
+Parallel PHPUnit runner written in Go. Works with PHPUnit 9 to 13 on PHP 8.1+.
 
 ```bash
 go build -o blink .
@@ -22,9 +22,10 @@ Requires the `pcntl` extension, so Linux or macOS only.
 ## How it works
 
 - Go starts N long-running `php worker.php` processes. Each loads `vendor/autoload.php` and all PHPUnit classes once.
-- Test files go into one queue, slowest first based on `.blink-timings.json` from the previous run. A free worker takes the next file.
-- For each file, the worker forks a child that runs a normal PHPUnit run on that file. Every file starts from the same clean, booted state, and a crash only kills the child.
-- The child reports results with `--log-teamcity php://fd/3`, a pipe only Go reads, so test output can't break it. Go prints progress, failures and a summary.
+- Test files are split into chunks, about 3 per worker, of similar total duration based on `.blink-timings.json` from the previous run. Neighbour files stay together. A free worker takes the next chunk, slowest first.
+- For each chunk, the worker forks a child that runs one normal PHPUnit run on all its files. The app or container boots once per chunk, not once per file. PHPUnit 9 accepts only one path, so there each file gets its own child.
+- If a child crashes, files it did not reach run again in a new child. If nothing ran at all, e.g. on a syntax error, each file runs alone to find the broken one.
+- Results come back via `--log-teamcity php://fd/3`, a pipe only Go reads, so test output can't break it. Go prints progress, failures and a summary.
 
 ## Tests
 

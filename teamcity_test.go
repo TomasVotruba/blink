@@ -49,3 +49,11 @@ func TestTestName(t *testing.T) {
 		t.Errorf("unexpected test name %q", name)
 	}
 }
+
+func TestTestPath(t *testing.T) {
+	msg, _ := parseMessage(`##teamcity[testStarted name='testBar' locationHint='php_qn:///app/tests/FooTest.php::\App\FooTest::testBar' flowId='1']`)
+
+	if path := testPath(msg); path != "/app/tests/FooTest.php" {
+		t.Errorf("unexpected test path %q", path)
+	}
+}
