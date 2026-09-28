@@ -136,6 +136,7 @@ func (w *worker) run(file string) (fileResult, error) {
 	}
 
 	var current *testResult
+	testCount := 0
 
 	for w.events.Scan() {
 		msg, ok := parseMessage(w.events.Text())
@@ -152,10 +153,18 @@ func (w *worker) run(file string) (fileResult, error) {
 				current.Message = msg.Attrs["message"]
 				current.Details = msg.Attrs["details"]
 			}
+		case "testCount":
+			testCount, _ = strconv.Atoi(msg.Attrs["count"])
 		case "testIgnored":
 			if current != nil {
 				current.Status = skipped
 				current.Message = msg.Attrs["message"]
+				continue
+			}
+
+			// PHPUnit 10+ skips a whole class with one message, e.g. for a missing extension
+			for range max(testCount-len(result.Tests), 1) {
+				result.Tests = append(result.Tests, testResult{Name: msg.Attrs["name"], Status: skipped, Message: msg.Attrs["message"]})
 			}
 		case "testFinished":
 			if current != nil {
