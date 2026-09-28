@@ -46,14 +46,17 @@ type runResult struct {
 	Output  string
 	// Crashed is set when the process ended early, so some files may not have run
 	Crashed bool
+	// Stopped is set when the run stopped at a file another worker took
+	Stopped bool
 }
 
 // worker is one long-running "php worker.php" process that runs test files one by one.
 type worker struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	events *bufio.Scanner
-	output chan string
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	control *os.File
+	events  *bufio.Scanner
+	output  chan string
 }
 
 func startWorker(ctx context.Context, php, script, autoloadFile string, phpunitArgs []string) (*worker, error) {
@@ -65,9 +68,13 @@ func startWorker(ctx context.Context, php, script, autoloadFile string, phpunitA
 	if err != nil {
 		return nil, err
 	}
+	controlRead, controlWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
 
 	cmd := exec.CommandContext(ctx, php, append([]string{script, autoloadFile}, phpunitArgs...)...)
-	cmd.ExtraFiles = []*os.File{eventsWrite} // fd 3 in the worker
+	cmd.ExtraFiles = []*os.File{eventsWrite, controlRead} // fd 3 and 4 in the worker
 	cmd.Stdout = outputWrite
 	cmd.Stderr = outputWrite
 	// own process group, so cancel also kills the forked child running the tests
@@ -88,11 +95,12 @@ func startWorker(ctx context.Context, php, script, autoloadFile string, phpunitA
 	// the worker holds the write ends now
 	eventsWrite.Close()
 	outputWrite.Close()
+	controlRead.Close()
 
 	events := bufio.NewScanner(eventsRead)
 	events.Buffer(make([]byte, 64*1024), 64*1024*1024)
 
-	w := &worker{cmd: cmd, stdin: stdin, events: events, output: make(chan string, 1)}
+	w := &worker{cmd: cmd, stdin: stdin, control: controlWrite, events: events, output: make(chan string, 1)}
 	go w.readOutput(outputRead)
 
 	// wait until the worker has booted, so its boot time is not counted to the first file
@@ -132,8 +140,9 @@ func (w *worker) readOutput(r io.Reader) {
 var errWorkerDied = errors.New("worker died")
 
 // run sends test files to the worker, which runs them in one PHPUnit process, and collects the results.
+// Before each file the run asks claim whether it may still run it.
 // It returns errWorkerDied when the worker process is gone and has to be replaced.
-func (w *worker) run(files []string) (runResult, error) {
+func (w *worker) run(files []string, claim func(file string) bool) (runResult, error) {
 	result := runResult{Files: files, Started: map[string]bool{}, Durations: map[string]float64{}}
 
 	// PHPUnit reports real absolute paths
@@ -168,6 +177,13 @@ func (w *worker) run(files []string) (runResult, error) {
 		}
 
 		switch msg.Name {
+		case "claim":
+			answer := "1"
+			if !claim(fileByPath[msg.Attrs["file"]]) {
+				answer = "0"
+				result.Stopped = true
+			}
+			_, _ = w.control.WriteString(answer)
 		case "testStarted":
 			if current != nil {
 				// PHPUnit 9 runs each file in its own process, so the next file starts after a crash
@@ -224,7 +240,7 @@ func (w *worker) run(files []string) (runResult, error) {
 			case signal != 0:
 				result.Problem = problem
 				result.Crashed = true
-			case exitCode != 0 && !result.hasFailures() && !noTestsExecuted(&result):
+			case exitCode != 0 && !result.Stopped && !result.hasFailures() && !noTestsExecuted(&result):
 				result.Problem = problem
 			}
 
@@ -256,11 +272,13 @@ func (w *worker) drainOutput() string {
 func (w *worker) kill() {
 	_ = syscall.Kill(-w.cmd.Process.Pid, syscall.SIGKILL)
 	_ = w.cmd.Wait()
+	w.control.Close()
 }
 
 func (w *worker) stop() {
 	w.stdin.Close()
 	_ = w.cmd.Wait()
+	w.control.Close()
 }
 
 func (r *runResult) hasFailures() bool {
