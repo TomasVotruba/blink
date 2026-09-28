@@ -37,6 +37,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	workerCount := flags.Int("j", runtime.NumCPU(), "number of parallel workers")
 	php := flags.String("php", "php", "PHP binary")
 	configOption := flags.String("c", "", "PHPUnit configuration file (default: phpunit.xml or phpunit.xml.dist)")
+	preloadOption := flags.String("preload", "", "PHP file each worker runs once before forking, e.g. to boot the app")
 
 	// split before parsing, flag.Parse drops the "--" itself
 	args, phpunitArgs := splitArgs(args)
@@ -82,6 +83,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	preloadFile := ""
+	if *preloadOption != "" {
+		if preloadFile, err = filepath.Abs(*preloadOption); err == nil {
+			_, err = os.Stat(preloadFile)
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+	}
+
 	scriptDir, err := os.MkdirTemp("", "blink")
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -111,7 +123,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	start := time.Now()
 	report := newReport(stdout)
 
-	for result := range runChunks(ctx, chunks, workers, *php, script, autoloadFile, phpunitArgs) {
+	for result := range runChunks(ctx, chunks, workers, *php, script, autoloadFile, preloadFile, phpunitArgs) {
 		report.add(&result)
 		maps.Copy(timings, result.Durations)
 	}
@@ -140,7 +152,7 @@ func splitArgs(args []string) ([]string, []string) {
 
 // runChunks runs chunks of files on a pool of workers. Every worker takes the next chunk from one shared queue
 // once it is free, so a fast worker picks up more chunks.
-func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, script, autoloadFile string, phpunitArgs []string) <-chan runResult {
+func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, script, autoloadFile, preloadFile string, phpunitArgs []string) <-chan runResult {
 	queue := make(chan []string, len(chunks))
 	for _, chunk := range chunks {
 		queue <- chunk
@@ -172,7 +184,7 @@ func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, scr
 
 					if w == nil {
 						var err error
-						w, err = startWorker(ctx, php, script, autoloadFile, phpunitArgs)
+						w, err = startWorker(ctx, php, script, autoloadFile, preloadFile, phpunitArgs)
 						if err != nil {
 							results <- runResult{Files: files, Problem: "cannot start worker: " + err.Error()}
 							continue

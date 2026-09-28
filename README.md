@@ -16,8 +16,29 @@ Options:
 - `-j` - number of workers, defaults to CPU count
 - `-c` - PHPUnit config file, defaults to `phpunit.xml` or `phpunit.xml.dist`
 - `-php` - PHP binary, defaults to `php`
+- `-preload` - PHP file each worker runs once before forking, see below
 
 Requires the `pcntl` extension, so Linux or macOS only.
+
+## Preload
+
+Every chunk of test files runs in a fresh child forked from a worker. If your tests boot something expensive, e.g. a DI container, each chunk boots it again. A preload file boots it once per worker instead, and every forked child starts with it ready:
+
+```php
+<?php
+
+// blink-preload.php
+require __DIR__ . '/tests/bootstrap.php';
+
+// for Rector, see .github/preload/rector.php
+MyTestCase::bootContainer();
+```
+
+```bash
+blink -preload blink-preload.php
+```
+
+The file runs before PHPUnit reads its configuration, so `<php>` ini and env values from `phpunit.xml` are not set yet.
 
 ## How it works
 

@@ -45,3 +45,29 @@ func TestFixtures(t *testing.T) {
 		})
 	}
 }
+
+func TestPreload(t *testing.T) {
+	dir, err := filepath.Abs(filepath.Join("fixtures", "phpunit-13"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "vendor/autoload.php")); err != nil {
+		t.Skip("run composer install in " + dir)
+	}
+
+	marker := filepath.Join(t.TempDir(), "marker")
+	t.Setenv("BLINK_PRELOAD_MARKER", marker)
+	t.Chdir(dir)
+	t.Cleanup(func() { os.Remove(filepath.Join(dir, timingsFile)) })
+
+	var stdout, stderr bytes.Buffer
+	run([]string{"-preload", "../preload.php", "tests/PassingTest.php"}, &stdout, &stderr)
+
+	if !strings.Contains(stdout.String(), "Tests: 5, Passed: 5") {
+		t.Errorf("unexpected output\n%s%s", stdout.String(), stderr.String())
+	}
+
+	if content, err := os.ReadFile(marker); err != nil || string(content) != "preloaded" {
+		t.Errorf("expected preload file to run, got %q, %v", content, err)
+	}
+}

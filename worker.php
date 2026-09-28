@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-// blink worker: loads the autoloader once, then forks a PHPUnit run per line of tab separated test files from stdin.
+// blink worker: loads the autoloader and optional preload file once, then forks a PHPUnit run per line of tab separated test files from stdin.
 // Test results go to fd 3 as TeamCity messages, followed by "##blink[done ...]" once the run is over.
 
-[, $autoloadFile] = $argv;
-$phpunitArgs = array_slice($argv, 2);
+[, $autoloadFile, $preloadFile] = $argv;
+$phpunitArgs = array_slice($argv, 3);
 
 if (!function_exists('pcntl_fork')) {
     fwrite(STDERR, 'blink requires the pcntl extension' . PHP_EOL);
@@ -38,6 +38,11 @@ if (is_file($classMapFile)) {
     }
 
     error_reporting($errorLevel);
+}
+
+// boots the app once, so every forked child starts warm
+if ($preloadFile !== '') {
+    require $preloadFile;
 }
 
 $events = fopen('php://fd/3', 'wb');

@@ -56,7 +56,7 @@ type worker struct {
 	output chan string
 }
 
-func startWorker(ctx context.Context, php, script, autoloadFile string, phpunitArgs []string) (*worker, error) {
+func startWorker(ctx context.Context, php, script, autoloadFile, preloadFile string, phpunitArgs []string) (*worker, error) {
 	eventsRead, eventsWrite, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -66,7 +66,7 @@ func startWorker(ctx context.Context, php, script, autoloadFile string, phpunitA
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, php, append([]string{script, autoloadFile}, phpunitArgs...)...)
+	cmd := exec.CommandContext(ctx, php, append([]string{script, autoloadFile, preloadFile}, phpunitArgs...)...)
 	cmd.ExtraFiles = []*os.File{eventsWrite} // fd 3 in the worker
 	cmd.Stdout = outputWrite
 	cmd.Stderr = outputWrite

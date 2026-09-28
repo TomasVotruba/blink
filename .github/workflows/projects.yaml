@@ -26,6 +26,8 @@ jobs:
                         repository: rectorphp/rector-src
                         ref: 29e434b2065ae4a78a6b1eca4295620a5f6a2a5a
                         config: phpunit.xml
+                        # boots Rector and PHPStan containers once per worker
+                        preload: .github/preload/rector.php
 
         name: ${{ matrix.name }}
 
@@ -73,6 +75,17 @@ jobs:
                     ../blink -c ${{ matrix.config }} | tee ../blink.out || true
                     echo "BLINK_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
 
+            -   name: Run blink with preload
+                if: matrix.preload
+                working-directory: project
+                run: |
+                    cp ../${{ matrix.preload }} blink-preload.php
+                    # start without timings, same as the run above
+                    rm -f .blink-timings.json
+                    start=$(date +%s.%N)
+                    ../blink -c ${{ matrix.config }} -preload blink-preload.php | tee ../blink-preload.out || true
+                    echo "BLINK_PRELOAD_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
+
             -   name: Compare
                 run: |
                     phpunit_tests=$(php -r '$s = simplexml_load_file("phpunit.xml")->testsuite; echo $s["tests"];')
@@ -86,6 +99,14 @@ jobs:
 
                     speedup=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_TIME" | bc)
 
+                    if [ -f blink-preload.out ]; then
+                        preload_summary=$(grep '^Tests: ' blink-preload.out)
+                        preload_tests=$(echo "$preload_summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
+                        preload_failed=$(echo "$preload_summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
+                        preload_skipped=$(echo "$preload_summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
+                        preload_speedup=$(echo "scale=1; $PHPUNIT_TIME / $BLINK_PRELOAD_TIME" | bc)
+                    fi
+
                     {
                         echo "## ${{ matrix.name }}, ${{ matrix.repository }}@${{ matrix.ref }}, $(nproc) CPUs"
                         echo
@@ -93,11 +114,22 @@ jobs:
                         echo "| --- | ---: | ---: | ---: | ---: |"
                         printf "| PHPUnit | %.1fs | %s | %s | %s |\n" "$PHPUNIT_TIME" "$phpunit_tests" "$phpunit_failed" "$phpunit_skipped"
                         printf "| blink | %.1fs | %s | %s | %s |\n" "$BLINK_TIME" "$blink_tests" "$blink_failed" "$blink_skipped"
+                        if [ -f blink-preload.out ]; then
+                            printf "| blink -preload | %.1fs | %s | %s | %s |\n" "$BLINK_PRELOAD_TIME" "$preload_tests" "$preload_failed" "$preload_skipped"
+                        fi
                         echo
                         echo "blink is **${speedup}x** faster"
+                        if [ -f blink-preload.out ]; then
+                            echo "blink -preload is **${preload_speedup}x** faster"
+                        fi
                     } | tee -a "$GITHUB_STEP_SUMMARY"
 
                     if [ "$phpunit_tests" != "$blink_tests" ] || [ "$phpunit_skipped" != "$blink_skipped" ]; then
                         echo "::error::blink ran a different set of tests than PHPUnit"
+                        exit 1
+                    fi
+
+                    if [ -f blink-preload.out ] && { [ "$phpunit_tests" != "$preload_tests" ] || [ "$phpunit_skipped" != "$preload_skipped" ]; }; then
+                        echo "::error::blink -preload ran a different set of tests than PHPUnit"
                         exit 1
                     fi
