@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, BufReader, PipeReader, Write};
+use std::io::{self, BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -48,6 +48,8 @@ pub struct RunResult {
     pub output: String,
     /// set when the process ended early, so some files may not have run
     pub crashed: bool,
+    /// set when the run stopped at a file another worker took
+    pub stopped: bool,
 }
 
 impl RunResult {
@@ -84,6 +86,7 @@ pub struct WorkerDied;
 pub struct Worker {
     child: Child,
     stdin: Option<ChildStdin>,
+    control: PipeWriter,
     events: BufReader<PipeReader>,
     output: Receiver<String>,
 }
@@ -97,9 +100,11 @@ impl Worker {
     ) -> io::Result<Worker> {
         let (events_read, events_write) = io::pipe()?;
         let (output_read, output_write) = io::pipe()?;
+        let (control_read, control_write) = io::pipe()?;
 
         let mut child = {
             let events_fd = events_write.as_raw_fd();
+            let control_fd = control_read.as_raw_fd();
             let mut cmd = Command::new(php);
             cmd.arg(script)
                 .arg(autoload_file)
@@ -110,22 +115,24 @@ impl Worker {
                 // own process group, so a kill also reaches the forked child running the tests
                 .process_group(0);
 
-            // fd 3 in the worker, dup2 clears close-on-exec
+            // fd 3 and 4 in the worker
             unsafe {
                 cmd.pre_exec(move || {
-                    if events_fd == 3 {
-                        let flags = libc::fcntl(3, libc::F_GETFD);
-                        libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                    } else if libc::dup2(events_fd, 3) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
+                    // keep control out of the way of fd 3
+                    let control_fd = if control_fd == 3 {
+                        libc::dup(control_fd)
+                    } else {
+                        control_fd
+                    };
+                    move_fd(events_fd, 3)?;
+                    move_fd(control_fd, 4)
                 });
             }
 
             let child = cmd.spawn()?;
-            // the worker holds the write ends now, dropping cmd closes ours
+            // the worker holds its pipe ends now, dropping cmd closes ours
             drop(events_write);
+            drop(control_read);
             child
         };
 
@@ -137,6 +144,7 @@ impl Worker {
         let mut worker = Worker {
             stdin: child.stdin.take(),
             child,
+            control: control_write,
             events: BufReader::new(events_read),
             output,
         };
@@ -172,7 +180,12 @@ impl Worker {
     }
 
     /// Sends test files to the worker, which runs them in one PHPUnit process, and collects the results.
-    pub fn run(&mut self, files: Vec<String>) -> (RunResult, Result<(), WorkerDied>) {
+    /// Before each file the run asks claim whether it may still run it.
+    pub fn run(
+        &mut self,
+        files: Vec<String>,
+        mut claim: impl FnMut(&str) -> bool,
+    ) -> (RunResult, Result<(), WorkerDied>) {
         let mut result = RunResult::new(files);
 
         // PHPUnit reports real absolute paths
@@ -212,6 +225,14 @@ impl Worker {
 
         while let Some(msg) = self.next_message() {
             match msg.name.as_str() {
+                "claim" if msg.kind == "blink" => {
+                    let file = file_by_path
+                        .get(msg.attr("file"))
+                        .map_or("", String::as_str);
+                    let allowed = claim(file);
+                    result.stopped |= !allowed;
+                    let _ = self.control.write_all(if allowed { b"1" } else { b"0" });
+                }
                 "testStarted" => {
                     // PHPUnit 9 runs each file in its own process, so the next file starts after a crash
                     crashed(
@@ -288,6 +309,7 @@ impl Worker {
                         result.problem = problem;
                         result.crashed = true;
                     } else if exit_code != 0
+                        && !result.stopped
                         && !result.has_failures()
                         && !result.no_tests_executed()
                     {
@@ -328,6 +350,24 @@ impl Worker {
         let _ = self.child.wait();
         let pid = self.child.id() as i32;
         GROUPS.lock().unwrap().retain(|group| *group != pid);
+    }
+}
+
+/// Makes fd the given target fd of the new process, without close-on-exec.
+fn move_fd(fd: i32, target: i32) -> io::Result<()> {
+    let result = unsafe {
+        if fd == target {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+        } else {
+            libc::dup2(fd, target)
+        }
+    };
+
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

@@ -33,6 +33,8 @@ rust/target/release/blink-rs -j 4
 - Go starts N long-running `php worker.php` processes. Each loads `vendor/autoload.php` and all PHPUnit classes once.
 - Test files are split into chunks, about 3 per worker, of similar total duration based on `.blink-timings.json` from the previous run. Neighbour files stay together. A free worker takes the next chunk, slowest first.
 - For each chunk, the worker forks a child that runs one normal PHPUnit run on all its files. The app or container boots once per chunk, not once per file. PHPUnit 9 accepts only one path, so there each file gets its own child.
+- Before each test file, the child asks Go via fd 3 and 4 whether it may still run it. Once the queue is empty, a free worker takes the second half of the unstarted files of a running chunk, if they likely take over 1 second. The child stops at the first taken file, so all workers finish about together.
+- Without `-j`, Go watches `/proc/stat` on Linux. While at least one CPU is idle, e.g. tests wait on `sleep()`, network or subprocesses, it starts another worker, up to 2x the CPU count.
 - If a child crashes, files it did not reach run again in a new child. If nothing ran at all, e.g. on a syntax error, each file runs alone to find the broken one.
 - Results come back via `--log-teamcity php://fd/3`, a pipe only Go reads, so test output can't break it. Go prints progress, failures and a summary.
 

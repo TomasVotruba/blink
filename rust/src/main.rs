@@ -1,18 +1,20 @@
 mod discover;
+mod idle;
 mod report;
+mod scheduler;
 mod teamcity;
 mod timings;
 mod worker;
 
-use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use report::Report;
+use scheduler::Scheduler;
 use timings::{TIMINGS_FILE, chunk_files, load_timings, save_timings};
 use worker::{RunResult, Worker};
 
@@ -25,6 +27,8 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 struct Options {
     workers: usize,
+    /// -j was given, so no extra workers start
+    workers_given: bool,
     php: String,
     config: String,
     paths: Vec<String>,
@@ -113,6 +117,8 @@ fn execute(options: Options) -> Result<i32, String> {
     });
 
     let workers = options.workers.min(files.len());
+    // without -j, more workers start while CPUs are idle
+    let extra_workers = if options.workers_given { 0 } else { workers };
     let chunks = chunk_files(&files, &timings, workers * CHUNKS_PER_WORKER);
 
     let mut stdout = io::stdout();
@@ -124,6 +130,7 @@ fn execute(options: Options) -> Result<i32, String> {
     run_chunks(
         chunks,
         workers,
+        extra_workers,
         &options.php,
         &script,
         &autoload_file,
@@ -164,6 +171,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
 
     let mut options = Options {
         workers: cpu_count(),
+        workers_given: false,
         php: "php".to_string(),
         config: String::new(),
         paths: Vec::new(),
@@ -202,6 +210,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                 options.workers = value
                     .parse()
                     .map_err(|_| format!("invalid value \"{value}\" for flag -j"))?;
+                options.workers_given = true;
             }
             "c" => options.config = value()?,
             "php" => options.php = value()?,
@@ -216,76 +225,83 @@ fn cpu_count() -> usize {
     std::thread::available_parallelism().map_or(1, |count| count.get())
 }
 
-/// Runs chunks of files on a pool of workers. Every worker takes the next chunk from one shared queue
-/// once it is free, so a fast worker picks up more chunks.
+/// Runs chunks of files on a pool of workers, see Scheduler.
+#[allow(clippy::too_many_arguments)]
 fn run_chunks(
     chunks: Vec<Vec<String>>,
     worker_count: usize,
+    extra_workers: usize,
     php: &str,
     script: &str,
     autoload_file: &str,
     phpunit_args: &[String],
     mut on_result: impl FnMut(RunResult),
 ) {
-    let queue = Mutex::new(VecDeque::from(chunks));
+    let scheduler = Scheduler::new(chunks);
     let (sender, results) = mpsc::channel();
 
     std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let sender = sender.clone();
-            let queue = &queue;
-
+        let scheduler = &scheduler;
+        let spawn = move |id: usize, sender: mpsc::Sender<RunResult>| {
             scope.spawn(move || {
                 let mut worker: Option<Worker> = None;
 
-                loop {
-                    let Some(chunk) = queue.lock().unwrap().pop_front() else {
-                        break;
+                while let Some(files) = scheduler.next() {
+                    let current = match worker.as_mut() {
+                        Some(current) => current,
+                        None => match Worker::start(php, script, autoload_file, phpunit_args) {
+                            Ok(started) => worker.insert(started),
+                            Err(err) => {
+                                let mut result = RunResult::new(files);
+                                result.problem = format!("cannot start worker: {err}");
+                                let _ = sender.send(result);
+                                scheduler.done(Vec::new());
+                                continue;
+                            }
+                        },
                     };
-                    let mut pending = VecDeque::from([chunk]);
 
-                    while let Some(files) = pending.pop_front() {
-                        if INTERRUPTED.load(Ordering::SeqCst) {
-                            break;
-                        }
-
-                        let current = match worker.as_mut() {
-                            Some(current) => current,
-                            None => match Worker::start(php, script, autoload_file, phpunit_args) {
-                                Ok(started) => worker.insert(started),
-                                Err(err) => {
-                                    let mut result = RunResult::new(files);
-                                    result.problem = format!("cannot start worker: {err}");
-                                    let _ = sender.send(result);
-                                    continue;
-                                }
-                            },
-                        };
-
-                        let (mut result, status) = current.run(files);
-                        if status.is_err() {
-                            // the next run gets a fresh worker
-                            worker = None;
-                        }
-
-                        let reruns = rerun_files(&result);
-                        if !reruns.is_empty() && result.not_started().len() == result.files.len() {
-                            // nothing ran, the reruns report the problem
-                            result.problem.clear();
-                            result.output.clear();
-                        }
-
-                        let _ = sender.send(result);
-                        pending.extend(reruns);
+                    scheduler.started(id, &files);
+                    let (mut result, status) = current.run(files, |file| scheduler.claim(id, file));
+                    let stolen = scheduler.finished(id);
+                    if status.is_err() {
+                        // the next run gets a fresh worker
+                        worker = None;
                     }
+
+                    // files another worker took are reported there
+                    result.files.retain(|file| !stolen.contains(file));
+
+                    let rest = rerun_files(&result);
+                    if !rest.is_empty() && result.not_started().len() == result.files.len() {
+                        // nothing ran, the reruns report the problem
+                        result.problem.clear();
+                        result.output.clear();
+                    }
+
+                    let _ = sender.send(result);
+                    scheduler.done(rest);
                 }
 
                 if let Some(worker) = worker {
                     worker.stop();
                 }
             });
+        };
+
+        for id in 0..worker_count {
+            spawn(id, sender.clone());
         }
-        drop(sender);
+
+        let mut next_id = worker_count;
+        scope.spawn(move || {
+            idle::watch_idle_cpus(scheduler, extra_workers, || {
+                scheduler.add_worker(|| {
+                    spawn(next_id, sender.clone());
+                    next_id += 1;
+                })
+            });
+        });
 
         for result in results {
             on_result(result);
@@ -296,11 +312,16 @@ fn run_chunks(
 /// Returns files that did not run because their run ended early.
 /// Without any progress, e.g. on a syntax error, each file runs alone to find the broken one.
 fn rerun_files(result: &RunResult) -> Vec<Vec<String>> {
+    let not_started = result.not_started();
+    if result.stopped && !result.crashed && result.problem.is_empty() && !not_started.is_empty() {
+        // a run stops at the first taken file, with a custom test order some of its files may come later
+        return vec![not_started];
+    }
+
     if !result.crashed && result.problem.is_empty() {
         return Vec::new();
     }
 
-    let not_started = result.not_started();
     if not_started.is_empty() {
         Vec::new()
     } else if not_started.len() < result.files.len() {

@@ -105,13 +105,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 
 	workers := min(*workerCount, len(files))
+
+	// without -j, more workers start while CPUs are idle
+	extraWorkers := workers
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "j" {
+			extraWorkers = 0
+		}
+	})
 	chunks := chunkFiles(files, timings, workers*chunksPerWorker)
 	fmt.Fprintf(stdout, "blink - %d files, %d workers\n\n", len(files), workers)
 
 	start := time.Now()
 	report := newReport(stdout)
 
-	for result := range runChunks(ctx, chunks, workers, *php, script, autoloadFile, phpunitArgs) {
+	for result := range runChunks(ctx, chunks, workers, extraWorkers, *php, script, autoloadFile, phpunitArgs) {
 		report.add(&result)
 		maps.Copy(timings, result.Durations)
 	}
@@ -138,19 +146,13 @@ func splitArgs(args []string) ([]string, []string) {
 	return args[:index], args[index+1:]
 }
 
-// runChunks runs chunks of files on a pool of workers. Every worker takes the next chunk from one shared queue
-// once it is free, so a fast worker picks up more chunks.
-func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, script, autoloadFile string, phpunitArgs []string) <-chan runResult {
-	queue := make(chan []string, len(chunks))
-	for _, chunk := range chunks {
-		queue <- chunk
-	}
-	close(queue)
-
+// runChunks runs chunks of files on a pool of workers, see scheduler.
+func runChunks(ctx context.Context, chunks [][]string, workerCount, extraWorkers int, php, script, autoloadFile string, phpunitArgs []string) <-chan runResult {
+	s := newScheduler(ctx, chunks)
 	results := make(chan runResult)
 	var wg sync.WaitGroup
 
-	for range workerCount {
+	spawn := func() {
 		wg.Go(func() {
 			var w *worker
 			defer func() {
@@ -159,43 +161,49 @@ func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, scr
 				}
 			}()
 
-			for chunk := range queue {
-				pending := [][]string{chunk}
-
-				for len(pending) > 0 {
-					if ctx.Err() != nil {
-						return
-					}
-
-					files := pending[0]
-					pending = pending[1:]
-
-					if w == nil {
-						var err error
-						w, err = startWorker(ctx, php, script, autoloadFile, phpunitArgs)
-						if err != nil {
-							results <- runResult{Files: files, Problem: "cannot start worker: " + err.Error()}
-							continue
-						}
-					}
-
-					result, err := w.run(files)
-					if errors.Is(err, errWorkerDied) {
-						// the next run gets a fresh worker
-						w = nil
-					}
-					reruns := rerunFiles(&result)
-					if len(reruns) > 0 && len(result.notStarted()) == len(files) {
-						// nothing ran, the reruns report the problem
-						result.Problem, result.Output = "", ""
-					}
-
-					results <- result
-					pending = append(pending, reruns...)
+			for {
+				files, ok := s.next()
+				if !ok {
+					return
 				}
+
+				if w == nil {
+					var err error
+					w, err = startWorker(ctx, php, script, autoloadFile, phpunitArgs)
+					if err != nil {
+						results <- runResult{Files: files, Problem: "cannot start worker: " + err.Error()}
+						s.done(nil)
+						continue
+					}
+				}
+
+				s.started(w, files)
+				result, err := w.run(files, func(file string) bool { return s.claim(w, file) })
+				stolen := s.finished(w)
+				if errors.Is(err, errWorkerDied) {
+					// the next run gets a fresh worker
+					w = nil
+				}
+
+				// files another worker took are reported there
+				result.Files = slices.DeleteFunc(result.Files, func(file string) bool { return stolen[file] })
+
+				rest := rerunFiles(&result)
+				if len(rest) > 0 && len(result.notStarted()) == len(result.Files) {
+					// nothing ran, the reruns report the problem
+					result.Problem, result.Output = "", ""
+				}
+
+				results <- result
+				s.done(rest)
 			}
 		})
 	}
+
+	for range workerCount {
+		spawn()
+	}
+	go watchIdleCPUs(ctx, extraWorkers, func() bool { return s.addWorker(spawn) })
 
 	go func() {
 		wg.Wait()
@@ -208,11 +216,16 @@ func runChunks(ctx context.Context, chunks [][]string, workerCount int, php, scr
 // rerunFiles returns files that did not run because their run ended early.
 // Without any progress, e.g. on a syntax error, each file runs alone to find the broken one.
 func rerunFiles(result *runResult) [][]string {
+	notStarted := result.notStarted()
+	if result.Stopped && !result.Crashed && result.Problem == "" && len(notStarted) > 0 {
+		// a run stops at the first taken file, with a custom test order some of its files may come later
+		return [][]string{notStarted}
+	}
+
 	if !result.Crashed && result.Problem == "" {
 		return nil
 	}
 
-	notStarted := result.notStarted()
 	switch {
 	case len(notStarted) == 0:
 		return nil
