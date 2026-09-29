@@ -1,6 +1,6 @@
 name: Projects
 
-# runs test suites of real projects with plain PHPUnit, ParaTest, blink and blink-rs, compares results and speed
+# runs test suites of real projects with plain PHPUnit, ParaTest and blink, compares results and speed
 
 on:
     pull_request: null
@@ -40,10 +40,6 @@ jobs:
                     go-version: "1.26.6"
 
             -   run: go build -o blink .
-
-            -   uses: dtolnay/rust-toolchain@stable
-
-            -   run: cargo build --release --manifest-path rust/Cargo.toml && cp rust/target/release/blink-rs .
 
             # same extensions as Laravel's own CI
             -   uses: shivammathur/setup-php@v2
@@ -92,15 +88,6 @@ jobs:
                     ../blink -c ${{ matrix.config }} | tee ../blink.out || true
                     echo "BLINK_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
 
-            # without timings of the Go run, so both start from the same state
-            -   name: Run blink-rs
-                working-directory: project
-                run: |
-                    rm -f .blink-timings.json
-                    start=$(date +%s.%N)
-                    ../blink-rs -c ${{ matrix.config }} | tee ../blink-rs.out || true
-                    echo "BLINK_RS_TIME=$(echo "$(date +%s.%N) - $start" | bc)" >> "$GITHUB_ENV"
-
             -   name: Compare
                 run: |
                     junit() {
@@ -134,16 +121,11 @@ jobs:
                             row ParaTest "$PARATEST_TIME" "$tests" "$failed" "$skipped"
                         fi
 
-                        for runner in blink blink-rs; do
-                            summary=$(grep '^Tests: ' $runner.out)
-                            tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
-                            failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
-                            skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
-                            time=$BLINK_TIME
-                            [ "$runner" = blink-rs ] && time=$BLINK_RS_TIME
-
-                            row "$runner" "$time" "$tests" "$failed" "$skipped"
-                        done
+                        summary=$(grep '^Tests: ' blink.out)
+                        tests=$(echo "$summary" | sed -E 's/^Tests: ([0-9]+),.*/\1/')
+                        failed=$(echo "$summary" | sed -E 's/.*Failed: ([0-9]+),.*/\1/')
+                        skipped=$(echo "$summary" | sed -E 's/.*Skipped: ([0-9]+),.*/\1/')
+                        row blink "$BLINK_TIME" "$tests" "$failed" "$skipped"
                     } > table.md
 
                     tee -a "$GITHUB_STEP_SUMMARY" < table.md
