@@ -2,6 +2,9 @@
     "name": "tomasvotruba/blink",
     "description": "Tooling available in any PHP version, esp. legacy ones",
     "license": "MIT",
+    "bin": [
+        "bin/blink"
+    ],
     "require": {
         "php": ">=5.3"
     }
