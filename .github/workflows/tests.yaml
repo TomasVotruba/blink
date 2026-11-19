@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+    pull_request: null
+    push:
+        branches:
+            - main
+
+jobs:
+    install:
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+                php: ["5.6"]
+
+        runs-on: ${{ matrix.os }}
+        steps:
+            -   uses: actions/checkout@v4
+                with:
+                    path: blink
+
+            -   uses: shivammathur/setup-php@v2
+                with:
+                    php-version: ${{ matrix.php }}
+                    coverage: none
+
+            # install into a PHP 5.6 project, then check and fix a file
+            -   run: |
+                    mkdir project && cd project
+                    printf '<?php\nfunction foo( $a ){\n  return $a ;\n}\n' > foo.php
+                    composer config repositories.blink '{"type": "path", "url": "../blink", "options": {"symlink": false}}'
+                    composer require --dev tomasvotruba/blink:@dev --no-interaction --no-progress
+
+                    if vendor/bin/blink foo.php; then
+                        echo "check should fail on unformatted file"
+                        exit 1
+                    fi
+
+                    vendor/bin/blink --fix foo.php
+                    vendor/bin/blink foo.php
+                    php -l foo.php

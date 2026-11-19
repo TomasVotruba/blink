@@ -1,0 +1,32 @@
+#!/usr/bin/env sh
+# Runs the bundled blink Go binary for this OS and CPU, no PHP needed
+set -e
+
+# resolve symlinks, as Composer 1 links vendor/bin/blink here
+SELF="$0"
+while [ -L "$SELF" ]; do
+    LINK="$(readlink "$SELF")"
+    case "$LINK" in
+        /*) SELF="$LINK" ;;
+        *) SELF="$(dirname "$SELF")/$LINK" ;;
+    esac
+done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) os=unknown ;;
+esac
+case "$(uname -m)" in
+    x86_64 | amd64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) arch=unknown ;;
+esac
+
+if [ ! -x "$DIR/blink-$os-$arch" ]; then
+    echo "blink: no binary for $(uname -s) $(uname -m)" >&2
+    exit 1
+fi
+
+exec "$DIR/blink-$os-$arch" "$@"
