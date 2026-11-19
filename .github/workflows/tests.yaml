@@ -29,8 +29,8 @@ jobs:
             -   run: |
                     mkdir project && cd project
                     printf '<?php\nfunction foo( $a ){\n  return $a ;\n}\n' > foo.php
-                    composer config repositories.blink '{"type": "path", "url": "../blink", "options": {"symlink": false}}'
-                    composer require --dev tomasvotruba/blink:@dev --no-interaction --no-progress
+                    echo '{"repositories": [{"type": "path", "url": "../blink", "options": {"symlink": false}}], "require-dev": {"tomasvotruba/blink": "*@dev"}}' > composer.json
+                    composer install --no-interaction --no-progress
 
                     if vendor/bin/blink foo.php; then
                         echo "check should fail on unformatted file"
