@@ -1,0 +1,8 @@
+{
+    "name": "blink/blink",
+    "description": "Tooling available in any PHP version, esp. legacy ones",
+    "license": "MIT",
+    "require": {
+        "php": ">=5.3"
+    }
+}
